@@ -29,7 +29,7 @@ from typing import List, Tuple
 class SimulationConfig:
     """Konfigurasi simulasi"""
     # MPC parameters
-    dt: float = 0.1          # Sample time (s) - 10 Hz
+    dt: float = 0.05         # Sample time (s) - 10 Hz
     Np: int = 6              # Prediction horizon
     Nc: int = 3              # Control horizon
     
@@ -517,7 +517,7 @@ def main():
     results = run_simulation(config)
     
     # Plot results
-    plot_results(results)
+    # plot_results(results)
     
     print("\n" + "="*70)
     print("Simulation complete!")
