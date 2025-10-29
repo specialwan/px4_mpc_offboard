@@ -31,7 +31,7 @@ class SimulationConfig:
     # MPC parameters
     dt: float = 0.02         # Sample time (s) - 10 Hz
     Np: int = 10              # Prediction horizon
-    Nc: int = 3              # Control horizon
+    Nc: int = 5              # Control horizon
     
     # Simulation parameters
     sim_duration: float = 30.0   # Durasi simulasi (detik)
@@ -60,7 +60,7 @@ class MPCController:
     Control: [ax, ay, az]
     """
 
-    def __init__(self, dt=0.05, Np=10, Nc=3):
+    def __init__(self, dt=0.05, Np=10, Nc=5):
         """
         Initialize MPC controller
         
