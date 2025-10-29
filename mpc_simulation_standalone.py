@@ -59,8 +59,8 @@ class MPCController:
     State: [x, y, z, vx, vy, vz]
     Control: [ax, ay, az]
     """
-    
-    def __init__(self, dt=0.1, Np=6, Nc=3):
+
+    def __init__(self, dt=0.05, Np=10, Nc=3):
         """
         Initialize MPC controller
         
