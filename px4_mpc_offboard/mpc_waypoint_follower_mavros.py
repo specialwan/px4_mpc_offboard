@@ -79,7 +79,7 @@ class MPCPositionController:
                           1.0, 1.0, 30.0])     # Velocity damping (vz >> vx,vy)
         
         # Control effort weight - VERY LOW to allow aggressive Z control
-        self.R = np.diag([0.05, 0.05, 0.05])       # Lower R_z = prioritize vertical acceleration
+        self.R = np.diag([0.01, 0.01, 0.01])       # Lower R_z = prioritize vertical acceleration
         
         # Control rate weight - LOWER for responsive control
         self.R_delta = np.diag([0.3, 0.3, 0.2])  # Lower delta_z = allow fast Z changes
