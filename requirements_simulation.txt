@@ -1,0 +1,17 @@
+# Requirements for MPC Simulation (Standalone - No ROS)
+# ======================================================
+# 
+# Install with:
+#   pip3 install -r requirements_simulation.txt
+#
+# For Raspberry Pi:
+#   sudo apt install python3-pip python3-numpy python3-matplotlib
+#   pip3 install -r requirements_simulation.txt
+
+# Core dependencies
+numpy>=1.19.0
+quadprog>=0.1.11
+matplotlib>=3.3.0
+
+# Optional: For better performance on Raspberry Pi
+# scipy>=1.5.0  # Uncomment if needed for additional optimization
