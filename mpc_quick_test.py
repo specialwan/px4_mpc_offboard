@@ -24,7 +24,7 @@ def quick_test():
     # Test configurations
     configs = [
         {'Np': 4, 'Nc': 2, 'dt': 0.1, 'name': 'Fast (Np=4)'},
-        {'Np': 6, 'Nc': 3, 'dt': 0.1, 'name': 'Balanced (Np=6)'},
+        {'Np': 6, 'Nc': 3, 'dt': 0.05, 'name': 'Balanced (Np=6)'},
         {'Np': 10, 'Nc': 3, 'dt': 0.1, 'name': 'Accurate (Np=10)'},
     ]
     
