@@ -29,10 +29,10 @@ from typing import List, Tuple
 class SimulationConfig:
     """Konfigurasi simulasi"""
     # MPC parameters
-    dt: float = 0.02         # Sample time (s) - 10 Hz
-    Np: int = 10              # Prediction horizon
-    Nc: int = 5              # Control horizon
-    
+    dt: float = 0.1        # Sample time (s) - 10 Hz
+    Np: int = 6              # Prediction horizon
+    Nc: int = 3              # Control horizon
+
     # Simulation parameters
     sim_duration: float = 30.0   # Durasi simulasi (detik)
     
@@ -60,7 +60,7 @@ class MPCController:
     Control: [ax, ay, az]
     """
 
-    def __init__(self, dt=0.05, Np=10, Nc=5):
+    def __init__(self, dt=0.1, Np=6, Nc=3):
         """
         Initialize MPC controller
         
