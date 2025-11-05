@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 ############################################################################
 #
-#   MPC Position Controller with Waypoint Following
+#   MPC Position Controller with Waypoint Following (MAVROS Version)
 #
 #   This version uses Model Predictive Control for trajectory optimization
 #   - MPC optimization: 10 Hz
@@ -15,19 +15,15 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.clock import Clock
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 import numpy as np
 import quadprog  # For QP optimization
-from scipy.spatial.transform import Rotation
 
-# MAVROS messages (instead of px4_msgs)
-from mavros_msgs.msg import State, AttitudeTarget
-from mavros_msgs.srv import CommandBool, SetMode
 from geometry_msgs.msg import PoseStamped, TwistStamped
-from sensor_msgs.msg import NavSatFix
+from mavros_msgs.msg import State, PositionTarget, AttitudeTarget
+from mavros_msgs.srv import CommandBool, SetMode
 from std_msgs.msg import Header
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 
 class MPCPositionController:
@@ -75,8 +71,8 @@ class MPCPositionController:
         
         # Cost matrices - ALTITUDE PRIORITY TUNING
         # Z has MUCH higher priority than X/Y to avoid horizontal drift eating all control
-        self.Q = np.diag([1.0, 1.0, 100.0,    # Position weights (Z >> X,Y to prioritize altitude)
-                          1.0, 1.0, 30.0])     # Velocity damping (vz >> vx,vy)
+        self.Q = np.diag([30.0, 30.0, 100.0,    # Position weights (Z >> X,Y to prioritize altitude)
+                          10.0, 10.0, 25.0])     # Velocity damping (vz >> vx,vy)
         
         # Control effort weight - VERY LOW to allow aggressive Z control
         self.R = np.diag([0.05, 0.05, 0.05])       # Lower R_z = prioritize vertical acceleration
@@ -209,183 +205,155 @@ class MPCPositionController:
             return np.zeros(self.nu)
 
 
-# def acceleration_to_attitude_thrust_px4(accel_ned, yaw_desired, hover_thrust=0.59, gravity=9.81):
-#     """
-#     Convert acceleration to attitude + thrust using SIMPLIFIED PX4-inspired algorithm
+def acceleration_to_attitude_thrust_px4(accel_ned, yaw_desired, hover_thrust=0.59, gravity=9.81):
+    """
+    Convert acceleration to attitude + thrust using SIMPLIFIED PX4-inspired algorithm
     
-#     Key idea:
-#     1. Total specific force = gravity + desired acceleration
-#     2. Body Z points in direction of total specific force (thrust direction)
-#     3. Thrust magnitude compensates gravity + provides desired acceleration
+    Key idea:
+    1. Total specific force = gravity + desired acceleration
+    2. Body Z points in direction of total specific force (thrust direction)
+    3. Thrust magnitude compensates gravity + provides desired acceleration
     
-#     Args:
-#         accel_ned: [ax, ay, az] in NED frame (m/sÂ²)
-#         yaw_desired: Desired yaw (rad)
-#         hover_thrust: Hover thrust (0-1), default 0.59
-#         gravity: Gravity (m/sÂ²)
+    Args:
+        accel_ned: [ax, ay, az] in NED frame (m/s²)
+        yaw_desired: Desired yaw (rad)
+        hover_thrust: Hover thrust (0-1), default 0.59
+        gravity: Gravity (m/s²)
     
-#     Returns:
-#         roll, pitch, yaw, thrust_normalized
-#     """
+    Returns:
+        roll, pitch, yaw, thrust_normalized
+    """
     
-#     ax, ay, az = accel_ned[0], accel_ned[1], accel_ned[2]
+    ax, ay, az = accel_ned[0], accel_ned[1], accel_ned[2]
     
-#     # ========== SAFETY: LIMIT ACCELERATION ==========
-#     # Prevent extreme accelerations that could cause instability
-#     ax = np.clip(ax, -3.0, 3.0)
-#     ay = np.clip(ay, -3.0, 3.0)
-#     az = np.clip(az, -5.0, 5.0)  # Vertical: allow larger range
+    # ========== SAFETY: LIMIT ACCELERATION ==========
+    # Prevent extreme accelerations that could cause instability
+    ax = np.clip(ax, -6.0, 6.0)
+    ay = np.clip(ay, -6.0, 6.0)
+    az = np.clip(az, -5.0, 5.0)  # Vertical: allow larger range
     
-#     # ========== STEP 1: Compute desired specific force ==========
-#     # Newton's law: F_thrust = m * (a_desired - g_vector)
-#     # In NED frame:
-#     #   - Gravity vector: [0, 0, +g] (down is positive)
-#     #   - Desired acceleration: [ax, ay, az] (az < 0 = up)
-#     #   - Thrust specific force: [ax, ay, az - g]
-#     #
-#     # Examples:
-#     #   Hover (az=0):  [0, 0, 0-9.81] = [0, 0, -9.81] â†’ thrust=9.81 âœ…
-#     #   Climb (az=-3): [0, 0, -3-9.81] = [0, 0, -12.81] â†’ thrust=12.81 âœ…
-#     specific_force = np.array([ax, ay, az - gravity])
+    # ========== STEP 1: Compute desired specific force ==========
+    # Newton's law: F_thrust = m * (a_desired - g_vector)
+    # In NED frame:
+    #   - Gravity vector: [0, 0, +g] (down is positive)
+    #   - Desired acceleration: [ax, ay, az] (az < 0 = up)
+    #   - Thrust specific force: [ax, ay, az - g]
+    #
+    # Examples:
+    #   Hover (az=0):  [0, 0, 0-9.81] = [0, 0, -9.81] → thrust=9.81 ✅
+    #   Climb (az=-3): [0, 0, -3-9.81] = [0, 0, -12.81] → thrust=12.81 ✅
+    specific_force = np.array([ax, ay, az - gravity])
     
-#     # Magnitude of specific force (this determines thrust)
-#     thrust_magnitude = np.linalg.norm(specific_force)
+    # Magnitude of specific force (this determines thrust)
+    thrust_magnitude = np.linalg.norm(specific_force)
     
-#     # Safety: minimum thrust to overcome gravity
-#     if thrust_magnitude < gravity:  # At least gravity to hover
-#         thrust_magnitude = gravity
+    # Safety: minimum thrust to overcome gravity
+    if thrust_magnitude < gravity:  # At least gravity to hover
+        thrust_magnitude = gravity
     
-#     # Body Z-axis: direction of thrust (opposite to specific force in body frame)
-#     # In NED frame, thrust points opposite to specific force
-#     body_z = -specific_force / np.linalg.norm(specific_force)  # Use original magnitude for direction
+    # Body Z-axis: direction of thrust (opposite to specific force in body frame)
+    # In NED frame, thrust points opposite to specific force
+    body_z = -specific_force / np.linalg.norm(specific_force)  # Use original magnitude for direction
     
-#     # ========== STEP 2: Convert thrust magnitude to normalized value ==========
-#     # Map physical thrust (m/sÂ²) to normalized thrust (0-1)
-#     # At hover: thrust = g (9.81 m/sÂ²) â†’ normalized = hover_thrust (0.59)
-#     # At climb: thrust > g â†’ normalized > hover_thrust
-#     # Scaling: normalized_thrust = (thrust / g) * hover_thrust
-#     thrust_normalized = (thrust_magnitude / gravity) * hover_thrust
+    # ========== STEP 2: Convert thrust magnitude to normalized value ==========
+    # Map physical thrust (m/s²) to normalized thrust (0-1)
+    # At hover: thrust = g (9.81 m/s²) → normalized = hover_thrust (0.59)
+    # At climb: thrust > g → normalized > hover_thrust
+    # Scaling: normalized_thrust = (thrust / g) * hover_thrust
+    thrust_normalized = (thrust_magnitude / gravity) * hover_thrust
     
-#     # Clamp thrust to REASONABLE range (allow > hover for climb!)
-#     thrust_normalized = np.clip(thrust_normalized, hover_thrust * 0.5, 1.0)  # Min 0.3, Max 1.0
+    # Clamp thrust to REASONABLE range (allow > hover for climb!)
+    thrust_normalized = np.clip(thrust_normalized, hover_thrust * 0.5, 1.0)  # Min 0.3, Max 1.0
     
-#     # DEBUG: Print thrust calculation (uncomment to debug)
-#     print(f"ðŸ” THRUST: az={az:.2f} â†’ specific_force=[{specific_force[0]:.1f},{specific_force[1]:.1f},{specific_force[2]:.1f}] â†’ mag={thrust_magnitude:.2f} m/sÂ² â†’ norm={thrust_normalized:.3f}")
+    # DEBUG: Print thrust calculation (uncomment to debug)
+    print(f"🔍 THRUST: az={az:.2f} → specific_force=[{specific_force[0]:.1f},{specific_force[1]:.1f},{specific_force[2]:.1f}] → mag={thrust_magnitude:.2f} m/s² → norm={thrust_normalized:.3f}")
     
-#     # ========== STEP 3: Build rotation matrix from body Z and yaw ==========
-#     # EXACT PX4 ALGORITHM from PositionControl::bodyzToAttitude()
+    # ========== STEP 3: Build rotation matrix from body Z and yaw ==========
+    # EXACT PX4 ALGORITHM from PositionControl::bodyzToAttitude()
     
-#     # Normalize body_z (safety check)
-#     if np.linalg.norm(body_z) < 1e-8:
-#         # Zero vector, set safe level value
-#         body_z = np.array([0.0, 0.0, 1.0])
+    # Normalize body_z (safety check)
+    if np.linalg.norm(body_z) < 1e-8:
+        # Zero vector, set safe level value
+        body_z = np.array([0.0, 0.0, 1.0])
     
-#     body_z = body_z / np.linalg.norm(body_z)  # Normalize
+    body_z = body_z / np.linalg.norm(body_z)  # Normalize
     
-#     # Vector of desired yaw direction in XY plane, rotated by PI/2
-#     y_C = np.array([-np.sin(yaw_desired), np.cos(yaw_desired), 0.0])
-    
-#     # Desired body_x axis, orthogonal to body_z
-#     body_x = np.cross(y_C, body_z)
-    
-#     # Keep nose to front while inverted upside down
-#     if body_z[2] < 0.0:
-#         body_x = -body_x
-    
-#     # Handle edge case: thrust in XY plane
-#     if abs(body_z[2]) < 0.000001:
-#         # Desired thrust is in XY plane, set X downside
-#         body_x = np.array([0.0, 0.0, 1.0])
-    
-#     body_x = body_x / np.linalg.norm(body_x)  # Normalize
-    
-#     # Desired body_y axis
-#     body_y = np.cross(body_z, body_x)
-    
-#     # Build rotation matrix R = [body_x | body_y | body_z] (column-wise)
-#     R = np.column_stack([body_x, body_y, body_z])
-    
-#     # ========== STEP 4: Extract Euler angles from rotation matrix ==========
-#     # Calculate euler angles (for logging only, must not be used for control)
-#     roll = np.arctan2(R[2, 1], R[2, 2])
-#     pitch = np.arcsin(-np.clip(R[2, 0], -1.0, 1.0))
-#     yaw = np.arctan2(R[1, 0], R[0, 0])
-    
-#     # SAFETY: Limit attitude angles (prevent extreme tilts)
-#     max_tilt = np.radians(35)  # 30 degrees max tilt
-#     roll = np.clip(roll, -max_tilt, max_tilt)
-#     pitch = np.clip(pitch, -max_tilt, max_tilt)
-    
-#     return roll, pitch, yaw, thrust_normalized, R
-
-def acceleration_to_attitude_thrust_ENU(accel_enu, yaw_desired, hover_thrust=0.59, gravity=9.81):
-    # ENU: X=East, Y=North, Z=Up
-    ax, ay, az = accel_enu
-
-    # Batasi akselerasi (safety)
-    ax = np.clip(ax, -3.0, 3.0)
-    ay = np.clip(ay, -3.0, 3.0)
-    az = np.clip(az, -5.0, 5.0)
-
-    # vektor gravitasi di ENU (turun = -Z)
-    g_vec = np.array([0.0, 0.0, -gravity])
-
-    # Total specific force (arah dorong) = g_vec - a_des (di dunia ENU)
-    # (interpretasi: untuk menghasilkan a_des ke atas, thrust harus melawan g dan sisa percepatan)
-    f_enu = g_vec - np.array([ax, ay, az])
-
-    # Besar gaya â†’ untuk thrust normalisasi
-    f_mag = np.linalg.norm(f_enu)
-    if f_mag < gravity:
-        f_mag = gravity
-
-    # Body -Z (arah thrust) searah f_enu; maka body Z (sumbu kamera ke bawah di PX4) berlawanan
-    body_z_enu = -f_enu / np.linalg.norm(f_enu)
-
-    # Yaw yang diinginkan (di ENU)
+    # Vector of desired yaw direction in XY plane, rotated by PI/2
     y_C = np.array([-np.sin(yaw_desired), np.cos(yaw_desired), 0.0])
-
-    body_x_enu = np.cross(y_C, body_z_enu)
-    if np.linalg.norm(body_x_enu) < 1e-6:
-        body_x_enu = np.array([1.0, 0.0, 0.0])
-    body_x_enu /= np.linalg.norm(body_x_enu)
-
-    body_y_enu = np.cross(body_z_enu, body_x_enu)
-
-    # Rotasi kolom [x|y|z] dalam ENU
-    R = np.column_stack([body_x_enu, body_y_enu, body_z_enu])
-
-    # Euler utk logging (bukan kontrol)
-    roll  = np.arctan2(R[2,1], R[2,2])
-    pitch = np.arcsin(-np.clip(R[2,0], -1.0, 1.0))
-    yaw   = np.arctan2(R[1,0], R[0,0])
-
-    max_tilt = np.radians(35)
-    roll  = np.clip(roll,  -max_tilt, max_tilt)
+    
+    # Desired body_x axis, orthogonal to body_z
+    body_x = np.cross(y_C, body_z)
+    
+    # Keep nose to front while inverted upside down
+    if body_z[2] < 0.0:
+        body_x = -body_x
+    
+    # Handle edge case: thrust in XY plane
+    if abs(body_z[2]) < 0.000001:
+        # Desired thrust is in XY plane, set X downside
+        body_x = np.array([0.0, 0.0, 1.0])
+    
+    body_x = body_x / np.linalg.norm(body_x)  # Normalize
+    
+    # Desired body_y axis
+    body_y = np.cross(body_z, body_x)
+    
+    # Build rotation matrix R = [body_x | body_y | body_z] (column-wise)
+    R = np.column_stack([body_x, body_y, body_z])
+    
+    # ========== STEP 4: Extract Euler angles from rotation matrix ==========
+    # Calculate euler angles (for logging only, must not be used for control)
+    roll = np.arctan2(R[2, 1], R[2, 2])
+    pitch = np.arcsin(-np.clip(R[2, 0], -1.0, 1.0))
+    yaw = np.arctan2(R[1, 0], R[0, 0])
+    
+    # SAFETY: Limit attitude angles (prevent extreme tilts)
+    max_tilt = np.radians(30)  # 30 degrees max tilt
+    roll = np.clip(roll, -max_tilt, max_tilt)
     pitch = np.clip(pitch, -max_tilt, max_tilt)
+    
+    return roll, pitch, yaw, thrust_normalized, R
 
-    # Thrust 0..1 (MAVROS expects UP positive; di AttitudeTarget thrust=0..1)
-    thrust_norm = (f_mag / gravity) * hover_thrust
-    thrust_norm = np.clip(thrust_norm, hover_thrust*0.5, 1.0)
 
-    return roll, pitch, yaw, thrust_norm, R
-
+def quaternion_to_euler(q):
+    """
+    Convert quaternion to Euler angles (roll, pitch, yaw)
+    
+    Args:
+        q: Quaternion [w, x, y, z]
+        
+    Returns:
+        roll, pitch, yaw in radians
+    """
+    w, x, y, z = q
+    
+    # Roll (x-axis rotation)
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+    
+    # Pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    if np.abs(sinp) >= 1.0:
+        pitch = np.copysign(np.pi / 2, sinp)  # Use 90 degrees if out of range
+    else:
+        pitch = np.arcsin(sinp)
+    
+    # Yaw (z-axis rotation)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+    
+    return roll, pitch, yaw
 
 
 class MPCWaypointFollower(Node):
     """
-    MPC-based waypoint follower that receives waypoints from custom publisher
+    MPC-based waypoint follower that receives waypoints from custom publisher (MAVROS Version)
     """
 
     def __init__(self):
-        super().__init__('mpc_waypoint_follower_mavros')
-        
-        qos_profile = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,  # Match MAVROS (not TRANSIENT_LOCAL)
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
-        )
+        super().__init__('mpc_waypoint_follower')
         
         # =================================================================
         # MPC CONTROLLER
@@ -393,44 +361,37 @@ class MPCWaypointFollower(Node):
         
         self.mpc = MPCPositionController(dt=0.1, Np=6, Nc=3)
         self.get_logger().info('MPC Controller initialized: dt=0.1s (10 Hz), Np=6, Nc=3')
-
+        qos_sensor = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=QoSDurabilityPolicy.VOLATILE
+        )
         # =================================================================
-        # SUBSCRIBERS (MAVROS)
+        # MAVROS SUBSCRIBERS
         # =================================================================
         
-        # Vehicle state (armed, mode, etc.)
         self.state_sub = self.create_subscription(
             State,
             '/mavros/state',
             self.state_callback,
-            qos_profile
-        )
+            10)
         
-        # Local position (NED frame)
-        self.position_sub = self.create_subscription(
+        self.local_pose_sub = self.create_subscription(
             PoseStamped,
             '/mavros/local_position/pose',
-            self.position_callback,
-            qos_profile
-        )
+            self.local_pose_callback,
+            qos_sensor
+            )
         
-        # Local velocity (ENU frame)
-        self.velocity_sub = self.create_subscription(
+        self.local_vel_sub = self.create_subscription(
             TwistStamped,
             '/mavros/local_position/velocity_local',
-            self.velocity_callback,
-            qos_profile
-        )
+            self.local_vel_callback,
+            qos_sensor
+            )
         
-        # GPS fix type (untuk cek apakah GPS ready)
-        self.gps_sub = self.create_subscription(
-            NavSatFix,
-            '/mavros/global_position/global',
-            self.gps_callback,
-            qos_profile
-        )
-        
-        # Waypoints from publisher
+        # Subscriber for waypoints from custom waypoint publisher
         self.waypoint_sub = self.create_subscription(
             PoseStamped,
             '/waypoint/target',
@@ -439,32 +400,27 @@ class MPCWaypointFollower(Node):
         )
 
         # =================================================================
-        # PUBLISHERS (MAVROS)
+        # MAVROS PUBLISHERS
         # =================================================================
         
-        # Attitude setpoint (roll, pitch, yaw, thrust)
+        # For attitude control
         self.attitude_pub = self.create_publisher(
             AttitudeTarget,
             '/mavros/setpoint_raw/attitude',
-            qos_profile
-        )
+            10)
+        
+        # For position control (backup)
+        self.setpoint_pub = self.create_publisher(
+            PositionTarget,
+            '/mavros/setpoint_raw/local',
+            10)
 
         # =================================================================
-        # SERVICE CLIENTS (MAVROS)
+        # MAVROS SERVICE CLIENTS
         # =================================================================
         
         self.arming_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
-        
-        # Wait for services
-        self.get_logger().info('Waiting for MAVROS services...')
-        while not self.arming_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('  Waiting for arming service...')
-        
-        while not self.set_mode_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('  Waiting for set_mode service...')
-        
-        self.get_logger().info('âœ“ MAVROS services ready')
 
         # =================================================================
         # TIMERS
@@ -476,376 +432,375 @@ class MPCWaypointFollower(Node):
         # Control output at 50 Hz
         self.control_timer = self.create_timer(0.02, self.control_loop)
         
-        # State machine at 1 Hz
-        self.state_machine_timer = self.create_timer(1.0, self.state_machine_callback)
+        # State machine at 2 Hz
+        self.state_timer = self.create_timer(0.5, self.state_machine_callback)
         
         # =================================================================
         # STATE VARIABLES
         # =================================================================
         
+        self.current_state = State()
         self.armed = False
         self.offboard_mode = False
-        self.state = "INIT"
-        self.offboard_setpoint_counter = 0
         
-        # Position estimate validity flag
-        self.position_valid = False
-        self.gps_fix = 0  # 0=no fix, 2=2D, 3=3D
-        
-        # Current state [x, y, z, vx, vy, vz]
+        # Current state [x, y, z, vx, vy, vz] (NED frame)
         self.current_position = np.zeros(3)
         self.current_velocity = np.zeros(3)
-        self.current_yaw = 0.0
+        self.current_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # [w, x, y, z]
         
-        # Target from waypoint publisher (ENU frame - MAVROS uses ENU!)
-        self.target_position = np.array([0.0, 0.0, 5.0])  # Default hover at 5m altitude
+        # Target from waypoint publisher (NED)
+        self.target_position = np.array([0.0, 0.0, -5.0])  # Default hover
         self.target_velocity = np.zeros(3)  # Target velocity (usually zero for waypoints)
         self.target_yaw = 0.0
         self.waypoint_received = False
+        self.last_waypoint_position = np.array([0.0, 0.0, -5.0])  # Track for duplicate detection
         
         # MPC computed acceleration (from optimization)
-        self.desired_acceleration = np.zeros(3)  # [ax, ay, az] in NED frame
-        self.mpc_acceleration = np.zeros(3)  # Latest MPC output
+        self.mpc_acceleration = np.zeros(3)  # [ax, ay, az] in NED frame
         
-        # Attitude setpoint (computed from acceleration)
+        # Attitude setpoint (computed from MPC acceleration using PX4 algorithm)
         self.attitude_roll = 0.0
         self.attitude_pitch = 0.0
         self.attitude_yaw = 0.0
-        self.attitude_thrust = 0.6  # Hover thrust (normalized 0-1 for MAVROS)
+        self.attitude_thrust = 0.59  # Hover thrust
+        self.attitude_R_matrix = np.eye(3)  # Identity rotation (level attitude)
         
-        # Control parameters
-        self.g = 9.81  # Gravity (m/s^2)
-        self.hover_thrust = 0.6  # Hover thrust (0-1 for MAVROS)
+        # Waypoint acceptance radius
+        self.acceptance_radius = 1.0  # meters
         
-        # Waypoint tracking
-        self.last_waypoint_position = np.array([0.0, 0.0, 5.0])  # Track for duplicate detection
-        self.acceptance_radius = 1.0  # Waypoint reached threshold (meters)
+        # Counter for setpoint publishing
+        self.setpoint_counter = 0
         
         self.get_logger().info('='*60)
-        self.get_logger().info('MPC WAYPOINT FOLLOWER - MAVROS VERSION')
-        self.get_logger().info('For Pixhawk 1 (FMUv2) without XRCE-DDS')
-        self.get_logger().info('='*60)
-        self.get_logger().info('Waiting for MAVROS connection...')
+        self.get_logger().info('MPC Attitude Control Waypoint Follower (MAVROS)')
+        self.get_logger().info('MPC → Acceleration → Attitude + Thrust (PX4 Algorithm)')
+        self.get_logger().info('MPC Optimization: 10 Hz | Control Output: 50 Hz')
         self.get_logger().info('Waiting for waypoints from publisher...')
+        self.get_logger().info('='*60)
 
+        self.xy_locked = False
     # =================================================================
-    # CALLBACKS - MAVROS SUBSCRIBERS
+    # MAVROS CALLBACKS
     # =================================================================
     
     def state_callback(self, msg):
-        """MAVROS State callback"""
+        """Update MAVROS state"""
+        prev_armed = self.armed
+        prev_offboard = self.offboard_mode
+        
+        self.current_state = msg
         self.armed = msg.armed
         self.offboard_mode = (msg.mode == "OFFBOARD")
         
-    def position_callback(self, msg):
-        """MAVROS Position callback (PoseStamped)"""
-        # MAVROS local_position/pose is already in local frame (consistent with PX4)
-        # No conversion needed
-        # self.current_position = np.array([
-        #     msg.pose.position.x,
-        #     msg.pose.position.y,
-        #     msg.pose.position.z
-        # ])
+        if prev_armed != self.armed:
+            if self.armed:
+                self.get_logger().info('✓ ARMED')
+            else:
+                self.get_logger().warn('✗ DISARMED')
         
-        self.current_position = np.array([
-            0.0,
-            0.0,
-            msg.pose.position.z
-        ])
+        if prev_offboard != self.offboard_mode:
+            if self.offboard_mode:
+                self.get_logger().info('✓ OFFBOARD MODE ACTIVE')
+            else:
+                self.get_logger().warn('✗ OFFBOARD MODE INACTIVE')
+    
+    def local_pose_callback(self, msg):
+        """Update current position (ENU to NED conversion)"""
+        # MAVROS uses ENU frame, convert to NED for MPC
+        # ENU: x=east, y=north, z=up
+        # NED: x=north, y=east, z=down
+        self.current_position[0] = msg.pose.position.y   # ENU y → NED x
+        self.current_position[1] = msg.pose.position.x   # ENU x → NED y  
+        self.current_position[2] = -msg.pose.position.z  # ENU z → NED z (negative)
         
-        # Extract yaw from quaternion
-        q = msg.pose.orientation
-        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        self.current_yaw = np.arctan2(siny_cosp, cosy_cosp)
-        
-        # Mark position as valid if we're receiving data
-        # Additional check: position should be reasonable (not NaN or huge values)
-        if not np.any(np.isnan(self.current_position)) and np.linalg.norm(self.current_position) < 1000.0:
-            self.position_valid = True
-        else:
-            self.position_valid = False
-        
-    def velocity_callback(self, msg):
-        """MAVROS Velocity callback (TwistStamped)"""
-        # MAVROS local_position/velocity_local is already in local frame
-        # No conversion needed
-        self.current_velocity = np.array([
-            msg.twist.linear.x,
-            msg.twist.linear.y,
-            msg.twist.linear.z
+        # Store orientation
+        self.current_orientation = np.array([
+            msg.pose.orientation.w,
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z
         ])
     
-    def gps_callback(self, msg):
-        """GPS Fix callback to monitor GPS status"""
-        # NavSatStatus.status values:
-        # -1 = NO_FIX
-        #  0 = FIX (unaugmented)
-        #  1 = SBAS_FIX
-        #  2 = GBAS_FIX
-        # We need at least a 3D fix (status >= 0)
-        self.gps_fix = msg.status.status
+    def local_vel_callback(self, msg):
+        """Update current velocity (ENU to NED conversion)"""
+        # Convert ENU velocity to NED
+        self.current_velocity[0] = msg.twist.linear.y   # ENU vy → NED vx
+        self.current_velocity[1] = msg.twist.linear.x   # ENU vx → NED vy
+        self.current_velocity[2] = -msg.twist.linear.z  # ENU vz → NED vz (negative)
     
     def waypoint_callback(self, msg):
-        """Receive waypoint from waypoint publisher (PoseStamped)"""
-        # Extract position
-        new_position = np.array([
-            msg.pose.position.x,
-            msg.pose.position.y,
-            msg.pose.position.z
-        ])
+        """Receive waypoint from custom waypoint publisher (PoseStamped)"""
+        # Extract position (assuming waypoint is in NED frame)
+        new_position = np.array([msg.pose.position.y, msg.pose.position.x, -msg.pose.position.z])
         
         # Check if this is a new waypoint (not duplicate)
-        if not hasattr(self, 'last_waypoint_position'):
-            self.last_waypoint_position = np.array([0.0, 0.0, 5.0])
-        
         if np.linalg.norm(new_position - self.last_waypoint_position) > 0.1:
-            # Update target directly
             self.target_position = new_position.copy()
             self.last_waypoint_position = new_position.copy()
             
             # Extract yaw from quaternion
-            qz = msg.pose.orientation.z
-            qw = msg.pose.orientation.w
-            self.target_yaw = 2.0 * np.arctan2(qz, qw)
+            q = [
+                msg.pose.orientation.w,
+                msg.pose.orientation.x, 
+                msg.pose.orientation.y,
+                msg.pose.orientation.z
+            ]
+            _, _, yaw = quaternion_to_euler(q)
+            self.target_yaw = yaw
             
-            if not self.waypoint_received:
-                self.waypoint_received = True
-            
+            # if not self.waypoint_received:
+            self.waypoint_received = True
+                
             self.get_logger().info(
-                f'ðŸ“ New waypoint: [{self.target_position[0]:.1f}, '
+                f'📍 New waypoint: [{self.target_position[0]:.1f}, '
                 f'{self.target_position[1]:.1f}, {self.target_position[2]:.1f}] '
-                f'yaw={np.degrees(self.target_yaw):.0f}Â°'
+                f'yaw={np.degrees(self.target_yaw):.0f}°'
             )
     
-    # =====================================================================
-    # MPC OPTIMIZATION (10 Hz)
-    # =====================================================================
+    # def mpc_callback(self):
+    #     """MPC optimization at 10 Hz - computes acceleration setpoint"""
+        
+    #     # Only run MPC when in offboard mode
+    #     if not self.offboard_mode:
+    #         return
+        
+    #     # IMPORTANT: If no waypoint received yet, hover at current XY position at -5m altitude
+    #     # Lock the target when first entering offboard mode!
+    #     if not self.waypoint_received:
+    #         # Only set target ONCE when we first enter offboard mode
+    #         # Check if target is still at default (0, 0, -5)
+    #         if np.allclose(self.target_position, [0.0, 0.0, -5.0]):
+    #             # Lock target to current XY, but Z = -5m
+    #             self.target_position[0] = self.current_position[0]  # Lock X
+    #             self.target_position[1] = self.current_position[1]  # Lock Y
+    #             self.target_position[2] = -5.0  # Target altitude
+    #             self.get_logger().info(
+    #                 f'🎯 Target locked: [{self.target_position[0]:.2f}, '
+    #                 f'{self.target_position[1]:.2f}, {self.target_position[2]:.2f}]'
+    #             )
+            
+    #         # CRITICAL: Zero velocity target for stable hover!
+    #         self.target_velocity = np.zeros(3)
+        
+    #     # Current state: [x, y, z, vx, vy, vz]
+    #     current_state = np.concatenate([self.current_position, self.current_velocity])
+        
+    #     # Reference state: [x_ref, y_ref, z_ref, vx_ref, vy_ref, vz_ref]
+    #     # Target velocity is zero for waypoint hovering
+    #     reference_state = np.concatenate([self.target_position, self.target_velocity])
+        
+    #     # ============================================================
+    #     # MPC OPTIMIZATION - Compute optimal acceleration
+    #     # ============================================================
+    #     acceleration = self.mpc.compute_control(current_state, reference_state)
+        
+    #     self.mpc_acceleration = acceleration
+        
+    #     # ============================================================
+    #     # CONVERT ACCELERATION TO ATTITUDE + THRUST (PX4 Algorithm)
+    #     # ============================================================
+    #     roll, pitch, yaw, thrust, R_matrix = acceleration_to_attitude_thrust_px4(
+    #         accel_ned=acceleration,
+    #         yaw_desired=self.target_yaw,
+    #         hover_thrust=0.4,  # X500 hover thrust
+    #         gravity=9.81
+    #     )
+        
+    #     # Store attitude setpoint
+    #     self.attitude_roll = roll
+    #     self.attitude_pitch = pitch
+    #     self.attitude_yaw = yaw
+    #     self.attitude_thrust = thrust
+    #     self.attitude_R_matrix = R_matrix  # Store rotation matrix for quaternion conversion
+        
+    #     # Log MPC output with detailed altitude tracking
+    #     pos_error = np.linalg.norm(self.target_position - self.current_position)
+    #     z_error = self.target_position[2] - self.current_position[2]  # Z error
+    #     vel_norm = np.linalg.norm(self.current_velocity)
+        
+    #     # COMPREHENSIVE DEBUG LOGGING
+    #     self.get_logger().info(
+    #         f'🎯 MPC OUTPUT:\n'
+    #         f'   Position: Z={self.current_position[2]:.2f}m → Target={self.target_position[2]:.2f}m (error={z_error:.2f}m)\n'
+    #         f'   Velocity: vz={self.current_velocity[2]:.2f} m/s\n'
+    #         f'   Acceleration: az={acceleration[2]:.3f} m/s² ({"CLIMB" if acceleration[2] < 0 else "DESCEND/HOVER"})\n'
+    #         f'   Thrust: {thrust:.3f} ({">"if thrust > 0.59 else "="if thrust == 0.59 else "<"} hover=0.59)\n'
+    #         f'   Attitude: R={np.rad2deg(roll):.1f}° P={np.rad2deg(pitch):.1f}° Y={np.rad2deg(yaw):.1f}°'
+    #     )
     
     def mpc_callback(self):
         """MPC optimization at 10 Hz - computes acceleration setpoint"""
-        
+
         # Only run MPC when in offboard mode
         if not self.offboard_mode:
             return
-        
-        # IMPORTANT: If no waypoint received yet, hover at current XY position at 5m altitude
-        # Lock the target when first entering offboard mode!
+
+        # (1) kalau belum ada waypoint → KUNCI XY ke posisi SEKARANG (tiap kali)
         if not self.waypoint_received:
-            # Only set target ONCE when we first enter offboard mode
-            # Check if target is still at default (0, 0, 5.0)
-            if np.allclose(self.target_position, [0.0, 0.0, 5.0]):
-                # Lock target to current XY, but Z = 5m (ENU: positive = up)
-                self.target_position[0] = self.current_position[0]  # Lock X
-                self.target_position[1] = self.current_position[1]  # Lock Y
-                self.target_position[2] = 5.0  # Target altitude (5m up in ENU)
-                self.get_logger().info(
-                    f'ðŸŽ¯ Target locked: [{self.target_position[0]:.2f}, '
-                    f'{self.target_position[1]:.2f}, {self.target_position[2]:.2f}] (ENU frame)'
-                )
-            
-            # CRITICAL: Zero velocity target for stable hover!
+            self.target_position[0] = self.current_position[0]  # kunci X
+            self.target_position[1] = self.current_position[1]  # kunci Y
+            self.target_position[2] = -5.0 # tetap minta 5 m
             self.target_velocity = np.zeros(3)
-        
+            self.xy_locked = True
+            self.get_logger().info(
+                f'🎯 XY locked to current: X={self.target_position[0]:.2f}, '
+                f'Y={self.target_position[1]:.2f}, Z={self.target_position[2]:.2f}'
+            )
+
         # Current state: [x, y, z, vx, vy, vz]
         current_state = np.concatenate([self.current_position, self.current_velocity])
-        
+
         # Reference state: [x_ref, y_ref, z_ref, vx_ref, vy_ref, vz_ref]
-        # Target velocity is zero for waypoint hovering
         reference_state = np.concatenate([self.target_position, self.target_velocity])
-        
+
         # ============================================================
         # MPC OPTIMIZATION - Compute optimal acceleration
         # ============================================================
         acceleration = self.mpc.compute_control(current_state, reference_state)
-        
+
+        # (2) PAKSA XY MATI BIAR NGGAK MAJU
+        # acceleration[0] = 0.0   # matikan kontrol X
+        # acceleration[1] = 0.0   # matikan kontrol Y
+
         self.mpc_acceleration = acceleration
-        
+
         # ============================================================
         # CONVERT ACCELERATION TO ATTITUDE + THRUST (PX4 Algorithm)
         # ============================================================
-        # IMPORTANT: Convert ENU acceleration to NED for PX4 algorithm
-        # ENU: X=East, Y=North, Z=Up
-        # NED: X=North, Y=East, Z=Down
-        # accel_ned = np.array([
-        #     acceleration[1],   # ENU Y (North) â†’ NED X (North)
-        #     acceleration[0],   # ENU X (East) â†’ NED Y (East)
-        #     -acceleration[2]   # ENU Z (Up) â†’ NED -Z (Down)
-        # ])
-        
-        # roll, pitch, yaw, thrust, R_matrix = acceleration_to_attitude_thrust_px4(
-        #     accel_ned=accel_ned,
-        #     yaw_desired=self.target_yaw,
-        #     hover_thrust=0.4,  # X500 hover thrust
-        #     gravity=9.81
-        # )
-
-        roll, pitch, yaw, thrust, R_matrix = acceleration_to_attitude_thrust_ENU(
-            accel_enu=acceleration,
+        roll, pitch, yaw, thrust, R_matrix = acceleration_to_attitude_thrust_px4(
+            accel_ned=acceleration,
             yaw_desired=self.target_yaw,
             hover_thrust=0.4,  # X500 hover thrust
             gravity=9.81
         )
 
-        # Store attitude setpoint
+        # simpan buat control_loop()
         self.attitude_roll = roll
         self.attitude_pitch = pitch
         self.attitude_yaw = yaw
         self.attitude_thrust = thrust
-        self.attitude_R_matrix = R_matrix  # Store rotation matrix for quaternion conversion
-        
-        # Log MPC output with detailed altitude tracking
-        pos_error = np.linalg.norm(self.target_position - self.current_position)
-        z_error = self.target_position[2] - self.current_position[2]  # Z error
-        vel_norm = np.linalg.norm(self.current_velocity)
-        
-        # COMPREHENSIVE DEBUG LOGGING
+        self.attitude_R_matrix = R_matrix
+
+        # Log MPC output dengan info Z
+        z_error = self.target_position[2] - self.current_position[2]
         self.get_logger().info(
-            f'ðŸŽ¯ MPC OUTPUT:\n'
-            f'   Position: Z={self.current_position[2]:.2f}m â†’ Target={self.target_position[2]:.2f}m (error={z_error:.2f}m)\n'
+            f'🎯 MPC OUTPUT:\n'
+            f'   Position: Z={self.current_position[2]:.2f}m → Target={self.target_position[2]:.2f}m (error={z_error:.2f}m)\n'
             f'   Velocity: vz={self.current_velocity[2]:.2f} m/s\n'
-            f'   Acceleration: az={acceleration[2]:.3f} m/sÂ² ({"CLIMB" if acceleration[2] < 0 else "DESCEND/HOVER"})\n'
+            f'   Acceleration: az={acceleration[2]:.3f} m/s² ({"CLIMB" if acceleration[2] < 0 else "DESCEND/HOVER"})\n'
             f'   Thrust: {thrust:.3f} ({">"if thrust > 0.59 else "="if thrust == 0.59 else "<"} hover=0.59)\n'
-            f'   Attitude: R={np.rad2deg(roll):.1f}Â° P={np.rad2deg(pitch):.1f}Â° Y={np.rad2deg(yaw):.1f}Â°'
+            f'   Attitude: R={np.rad2deg(roll):.1f}° P={np.rad2deg(pitch):.1f}° Y={np.rad2deg(yaw):.1f}°'
         )
+
+    def rotmat_nedfrd_to_quat_enuflu(self, R_ned_from_body_frd: np.ndarray):
+        """Convert NED-FRD rotation matrix to ENU-FLU quaternion for MAVROS"""
+        # Transform from NED->ENU and FRD->FLU
+        T_ENU_NED = np.array([[0, 1, 0],
+                              [1, 0, 0],
+                              [0, 0,-1]], dtype=float)
+        T_FRD_FLU = np.diag([1,-1,-1]).astype(float)
+        
+        # body(FLU) -> ENU
+        R_enu_from_body_flu = T_ENU_NED @ R_ned_from_body_frd @ T_FRD_FLU
+        
+        # rotation_matrix_to_quaternion returns [w,x,y,z]
+        wxyz = self.rotation_matrix_to_quaternion(R=R_enu_from_body_flu)
+        # geometry_msgs/Quaternion needs [x,y,z,w]
+        return np.array([wxyz[1], wxyz[2], wxyz[3], wxyz[0]], dtype=float)
+
     
-    # =====================================================================
-    # CONTROL LOOP (50 Hz)
-    # =====================================================================
+    # def control_loop(self):
+    #     """Control output at 50 Hz - publishes attitude setpoint from MPC"""
+        
+    #     # ============================================================
+    #     # PUBLISH ATTITUDE SETPOINT TO MAVROS
+    #     # ============================================================
+    #     attitude_msg = AttitudeTarget()
+    #     attitude_msg.header = Header()
+    #     attitude_msg.header.stamp = self.get_clock().now().to_msg()
+    #     attitude_msg.header.frame_id = "base_link"
+        
+    #     # Type mask: 0 means use all fields (thrust, orientation, rates)
+    #     attitude_msg.type_mask = 0
+        
+    #     # Convert rotation matrix to quaternion for MAVROS
+    #     q = self.rotation_matrix_to_quaternion(self.attitude_R_matrix)
+    #     attitude_msg.orientation.w = float(q[0])
+    #     attitude_msg.orientation.x = float(q[1])
+    #     attitude_msg.orientation.y = float(q[2])
+    #     attitude_msg.orientation.z = float(q[3])
+        
+    #     # Thrust (0-1, where 0.5 is typically hover)
+    #     attitude_msg.thrust = float(self.attitude_thrust)
+        
+    #     # Body rates (zero for attitude control)
+    #     attitude_msg.body_rate.x = 0.0
+    #     attitude_msg.body_rate.y = 0.0
+    #     attitude_msg.body_rate.z = 0.0
+        
+    #     # Publish attitude setpoint
+    #     self.attitude_pub.publish(attitude_msg)
+        
+    #     # Debug logging (every 0.5s at 50Hz)
+    #     if self.setpoint_counter % 25 == 0:
+    #         z_current = self.current_position[2]
+    #         z_target = self.target_position[2]
+    #         z_error = z_target - z_current
+    #         self.get_logger().info(
+    #             f'📤 Attitude Setpoint: Roll={np.rad2deg(self.attitude_roll):.1f}° '
+    #             f'Pitch={np.rad2deg(self.attitude_pitch):.1f}° '
+    #             f'Yaw={np.rad2deg(self.attitude_yaw):.1f}° '
+    #             f'Thrust={self.attitude_thrust:.3f} | '
+    #             f'Z: {z_current:.2f}→{z_target:.2f} (Δ={z_error:.2f}m)'
+    #         )
+        
+    #     self.setpoint_counter += 1
     
     def control_loop(self):
-        """Control loop: publish attitude setpoint at 50 Hz (MAVROS)"""
+        """Control output at 50 Hz - publishes attitude setpoint from MPC"""
         
-        # Create AttitudeTarget message (MAVROS)
-        attitude_msg = AttitudeTarget()
-        attitude_msg.header = Header()
-        attitude_msg.header.stamp = self.get_clock().now().to_msg()
-        attitude_msg.header.frame_id = "base_link"
-        
-        # Type mask: use attitude + thrust (ignore rates)
-        # Bit values from mavros_msgs/AttitudeTarget.msg:
-        # IGNORE_ROLL_RATE = 1, IGNORE_PITCH_RATE = 2, IGNORE_YAW_RATE = 4
-        # We want: attitude quaternion + thrust, ignore body rates
-        attitude_msg.type_mask = 7  # 1 + 2 + 4 = ignore all rates, use attitude + thrust
-        
-        # Convert Euler angles to quaternion
-        r = Rotation.from_euler('xyz', [self.attitude_roll, self.attitude_pitch, self.attitude_yaw])
-        q = r.as_quat()  # [x, y, z, w]
-        
-        attitude_msg.orientation.w = float(q[3])
-        attitude_msg.orientation.x = float(q[0])
-        attitude_msg.orientation.y = float(q[1])
-        attitude_msg.orientation.z = float(q[2])
-        
-        # Body rates (set to zero since we're using type_mask to ignore them)
-        attitude_msg.body_rate.x = 0.0
-        attitude_msg.body_rate.y = 0.0
-        attitude_msg.body_rate.z = 0.0
-        
-        # Thrust (0-1, positive for upward in MAVROS)
-        attitude_msg.thrust = float(self.attitude_thrust)
-        
-        # Publish attitude setpoint
-        self.attitude_pub.publish(attitude_msg)
-        
-        # Increment counter
-        self.offboard_setpoint_counter += 1
-        
-        # Debug: Log publishing rate (every 2 seconds)
-        if self.offboard_setpoint_counter % 100 == 0:
+        att = AttitudeTarget()
+        att.header.stamp = self.get_clock().now().to_msg()
+        att.header.frame_id = "map"
+
+        # Abaikan body rates, kita cuma kirim orientation + thrust
+        att.type_mask = (
+            AttitudeTarget.IGNORE_ROLL_RATE |
+            AttitudeTarget.IGNORE_PITCH_RATE |
+            AttitudeTarget.IGNORE_YAW_RATE
+        )
+
+        # Konversi R (body->NED) ke quat ENU/FLU
+        q_xyzw = self.rotmat_nedfrd_to_quat_enuflu(self.attitude_R_matrix)
+        att.orientation.x, att.orientation.y, att.orientation.z, att.orientation.w = map(float, q_xyzw)
+
+        # Thrust MAVROS 0..1 (positif ke ATAS)
+        att.thrust = float(np.clip(self.attitude_thrust, 0.0, 1.0))
+
+        # Body rates = 0
+        att.body_rate.x = att.body_rate.y = att.body_rate.z = 0.0
+
+        self.attitude_pub.publish(att)
+
+        if self.setpoint_counter % 25 == 0:
             self.get_logger().info(
-                f"📡 Setpoint stream: {self.offboard_setpoint_counter} samples sent | "
-                f"Thrust={self.attitude_thrust:.3f} | State={self.state}"
+                f'📤 AttitudeTarget ENU: thrust={att.thrust:.3f} q=[{att.orientation.x:.3f},'
+                f'{att.orientation.y:.3f},{att.orientation.z:.3f},{att.orientation.w:.3f}]'
             )
+        self.setpoint_counter += 1
+
     
     def state_machine_callback(self):
         """State machine for offboard mode activation and waypoint following"""
         
-        if self.state == "INIT":
-            # Tunggu setpoint streaming dulu sebelum ARM
-            # PX4 butuh setpoint sudah streaming SEBELUM offboard mode
-            if self.offboard_setpoint_counter > 100:  # 100 samples @ 50Hz = 2 detik
-                # Check GPS fix and position validity before allowing ARM
-                if self.gps_fix >= 0 and self.position_valid:
-                    self.state = "READY_TO_ARM"
-                    self.get_logger().info("="*60)
-                    self.get_logger().info(f"✅ Setpoint streaming ready ({self.offboard_setpoint_counter} samples @ 50Hz)")
-                    self.get_logger().info(f"✅ GPS Fix: {self.gps_fix} | Position Valid: {self.position_valid}")
-                    self.get_logger().info("Proceeding to ARM...")
-                    self.get_logger().info("="*60)
-                    self.get_logger().info(f"State: INIT -> READY_TO_ARM")
-                else:
-                    # Log GPS/position status every 1 second
-                    if self.offboard_setpoint_counter % 50 == 0:
-                        self.get_logger().warn(f"⚠️  Waiting for GPS fix and position estimate...")
-                        self.get_logger().warn(f"   GPS Fix: {self.gps_fix} (need >= 0) | Position Valid: {self.position_valid}")
-            else:
-                # Log progress every 1 second
-                if self.offboard_setpoint_counter % 50 == 0:
-                    self.get_logger().info(f"⏳ Streaming setpoints... ({self.offboard_setpoint_counter}/100 @ 50Hz)")
-                    self.get_logger().info(f"   GPS Fix: {self.gps_fix} | Position Valid: {self.position_valid}")
-        
-        elif self.state == "READY_TO_ARM":
-            # Kirim ARM command
-            self.arm()
-            self.state = "ARMING"
-            self.get_logger().info("📤 ARM command sent")
-            self.get_logger().info("State: READY_TO_ARM -> ARMING")
-        
-        elif self.state == "ARMING":
-            # Tunggu sampai benar-benar armed
-            if self.armed:
-                self.state = "ARMED_READY_OFFBOARD"
-                self.get_logger().info("✅ Vehicle ARMED")
-                self.get_logger().info("State: ARMING -> ARMED_READY_OFFBOARD")
-            else:
-                # Retry ARM command every 0.5 detik
-                if self.offboard_setpoint_counter % 25 == 0:
-                    self.arm()
-                    self.get_logger().info("⚠️  Retrying ARM command...")
-        
-        elif self.state == "ARMED_READY_OFFBOARD":
-            # Sudah armed, sekarang kirim offboard mode command
+        if self.current_state.mode != "OFFBOARD" and self.setpoint_counter > 10:
             self.set_offboard_mode()
-            self.state = "ACTIVATING_OFFBOARD"
-            self.get_logger().info("📤 OFFBOARD mode command sent")
-            self.get_logger().info("State: ARMED_READY_OFFBOARD -> ACTIVATING_OFFBOARD")
         
-        elif self.state == "ACTIVATING_OFFBOARD":
-            if self.offboard_mode:
-                # Success! Offboard mode activated
-                self.state = "TAKING_OFF"
-                self.get_logger().info("State: ACTIVATING_OFFBOARD -> TAKING_OFF")
-                self.get_logger().info(">>> Waiting for drone to lift off with attitude control <<<")
-            else:
-                # Retry set_offboard_mode every 0.5 seconds
-                if self.offboard_setpoint_counter % 25 == 0:
-                    self.set_offboard_mode()
-                    self.get_logger().info("⚠️  Retrying set_offboard_mode...")
+        if not self.current_state.armed and self.current_state.mode == "OFFBOARD":
+            self.arm()
         
-        elif self.state == "TAKING_OFF":
-            # Wait for altitude increasing (Z positive in ENU)
-            if self.current_position[2] > 0.5:  # Above 0.5m
-                self.state = "FOLLOWING_WAYPOINTS"
-                self.get_logger().info("State: TAKING_OFF -> FOLLOWING_WAYPOINTS")
-                self.get_logger().info("="*60)
-                self.get_logger().info("âœ… AIRBORNE! MPC Position Control Active!")
-                self.get_logger().info("Ready to follow waypoints from publisher")
-                self.get_logger().info("="*60)
-            else:
-                # Still on ground, keep publishing setpoints
-                if self.offboard_setpoint_counter % 50 == 0:  # Every 1 second
-                    z_current = self.current_position[2]
-                    self.get_logger().info(f"Taking off... Z={z_current:.2f}m (target > 0.5m) | Thrust={self.attitude_thrust:.3f}")
-        
-        elif self.state == "FOLLOWING_WAYPOINTS":
-            # Auto-recover offboard mode if lost
-            if not self.offboard_mode and self.armed:
-                self.get_logger().warn("âš ï¸  Offboard mode lost! Re-activating...")
-                self.set_offboard_mode()
-                return
-            
-            # Monitor waypoint following
+        # Monitor waypoint following with MPC info
+        if self.current_state.mode == "OFFBOARD" and self.current_state.armed:
             error = np.linalg.norm(self.current_position - self.target_position)
             
             if self.waypoint_received:
@@ -856,17 +811,16 @@ class MPCWaypointFollower(Node):
                 self.get_logger().info(
                     f"Pos: [{self.current_position[0]:.1f}, {self.current_position[1]:.1f}, {self.current_position[2]:.1f}] | "
                     f"Target: [{self.target_position[0]:.1f}, {self.target_position[1]:.1f}, {self.target_position[2]:.1f}] | "
-                    f"Error: {error:.2f}m | Vel: {vel_norm:.2f} m/s | Acc: {acc_norm:.2f} m/sÂ²"
+                    f"Error: {error:.2f}m | Vel: {vel_norm:.2f} m/s | Acc: {acc_norm:.2f} m/s²"
                 )
                 
                 # Check if waypoint reached
                 if error < self.acceptance_radius:
-                    self.get_logger().info(f"âœ“ Waypoint reached! (error: {error:.2f}m)")
+                    self.get_logger().info(f"✓ Waypoint reached! (error: {error:.2f}m)")
             else:
-                self.get_logger().info(
-                    f"Hovering at: [{self.current_position[0]:.1f}, {self.current_position[1]:.1f}, "
-                    f"{self.current_position[2]:.1f}] | Waiting for waypoints..."
-                )
+                self.get_logger().info(f"Hovering at: [{self.current_position[0]:.1f}, "
+                                      f"{self.current_position[1]:.1f}, {self.current_position[2]:.1f}] | "
+                                      f"Waiting for waypoints...")
     
     def rotation_matrix_to_quaternion(self, R):
         """
@@ -916,52 +870,49 @@ class MPCWaypointFollower(Node):
         
         return np.array([w, x, y, z])
     
-    def euler_to_quaternion(self, roll, pitch, yaw):
-        """
-        Convert Euler angles (roll, pitch, yaw) to quaternion [w, x, y, z]
-        
-        Args:
-            roll: Roll angle in radians
-            pitch: Pitch angle in radians
-            yaw: Yaw angle in radians
-            
-        Returns:
-            q: Quaternion [w, x, y, z]
-        """
-        # Compute half angles
-        cr = np.cos(roll * 0.5)
-        sr = np.sin(roll * 0.5)
-        cp = np.cos(pitch * 0.5)
-        sp = np.sin(pitch * 0.5)
-        cy = np.cos(yaw * 0.5)
-        sy = np.sin(yaw * 0.5)
-        
-        # Compute quaternion (ZYX convention)
-        w = cr * cp * cy + sr * sp * sy
-        x = sr * cp * cy - cr * sp * sy
-        y = cr * sp * cy + sr * cp * sy
-        z = cr * cp * sy - sr * sp * cy
-        
-        return np.array([w, x, y, z])
-    
-    # =====================================================================
-    # COMMAND FUNCTIONS (MAVROS)
-    # =====================================================================
-    
     def arm(self):
-        """Send arm command via MAVROS service"""
-        req = CommandBool.Request()
-        req.value = True
-        future = self.arming_client.call_async(req)
-        self.get_logger().info('>>> ARM command sent (MAVROS) <<<')
+        """Send arm command via MAVROS"""
+        while not self.arming_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Waiting for arming service...')
+        
+        request = CommandBool.Request()
+        request.value = True
+        
+        future = self.arming_client.call_async(request)
+        future.add_done_callback(self.arm_callback)
+    
+    def arm_callback(self, future):
+        """Callback for arm service"""
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info('>>> ARM command sent via MAVROS <<<')
+            else:
+                self.get_logger().error('Failed to arm via MAVROS')
+        except Exception as e:
+            self.get_logger().error(f'Service call failed: {e}')
     
     def set_offboard_mode(self):
-        """Switch to OFFBOARD mode via MAVROS service"""
-        req = SetMode.Request()
-        req.custom_mode = "OFFBOARD"
-        future = self.set_mode_client.call_async(req)
-        self.get_logger().info('>>> OFFBOARD mode command sent (MAVROS) <<<')
-        self.get_logger().info('>>> TAKEOFF command sent (2m) to clear ground <<<')
+        """Send command to switch to offboard mode via MAVROS"""
+        while not self.set_mode_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Waiting for set_mode service...')
+        
+        request = SetMode.Request()
+        request.custom_mode = "OFFBOARD"
+        
+        future = self.set_mode_client.call_async(request)
+        future.add_done_callback(self.set_mode_callback)
+    
+    def set_mode_callback(self, future):
+        """Callback for set_mode service"""
+        try:
+            response = future.result()
+            if response.mode_sent:
+                self.get_logger().info('>>> OFFBOARD mode command sent via MAVROS <<<')
+            else:
+                self.get_logger().error('Failed to set OFFBOARD mode via MAVROS')
+        except Exception as e:
+            self.get_logger().error(f'Service call failed: {e}')
 
 
 def main(args=None):
@@ -970,17 +921,17 @@ def main(args=None):
     node = MPCWaypointFollower()
     
     print("\n" + "="*60)
-    print("MPC WAYPOINT FOLLOWER")
+    print("MPC WAYPOINT FOLLOWER (MAVROS VERSION)")
     print("="*60)
     print("This node will:")
-    print("  1. Arm and enter offboard mode")
+    print("  1. Arm and enter offboard mode via MAVROS")
     print("  2. Hover at default position (0, 0, -5)")
-    print("  3. Follow waypoints from QGroundControl mission")
+    print("  3. Follow waypoints from waypoint publisher")
     print("")
     print("To use:")
-    print("  1. Wait for offboard mode to activate")
-    print("  2. In QGC, create a mission with waypoints")
-    print("  3. Upload and start the mission")
+    print("  1. Make sure MAVROS is running and connected to PX4")
+    print("  2. Wait for offboard mode to activate")
+    print("  3. Send waypoints to /waypoint/target topic")
     print("  4. Drone will follow the waypoints!")
     print("="*60 + "\n")
     

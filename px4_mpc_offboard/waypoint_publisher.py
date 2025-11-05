@@ -12,21 +12,20 @@ Features:
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
-from px4_msgs.msg import VehicleLocalPosition
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import numpy as np
 
 
-class WaypointPublisher(Node):
+class WaypointPublisherMavros(Node):
     def __init__(self):
-        super().__init__('waypoint_publisher')
+        super().__init__('waypoint_publisher_mavros')
         
-        # QoS profile for PX4 topics
+        # QoS profile for MAVROS topics (BEST_EFFORT + VOLATILE)
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,  # MAVROS uses VOLATILE, not TRANSIENT_LOCAL
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=10
         )
         
         # Publisher untuk waypoint
@@ -36,12 +35,12 @@ class WaypointPublisher(Node):
             10
         )
         
-        # Subscriber untuk posisi drone (untuk auto-advance)
+        # Subscriber untuk posisi drone dari MAVROS (untuk auto-advance)
         self.position_sub = self.create_subscription(
-            VehicleLocalPosition,
-            '/fmu/out/vehicle_local_position',
+            PoseStamped,
+            '/mavros/local_position/pose',
             self.position_callback,
-            qos_profile
+            qos_profile  # Use qos_profile here!
         )
         
         # State variables
@@ -54,7 +53,7 @@ class WaypointPublisher(Node):
         self.declare_parameter('continuous_mode', True)  # True = smooth continuous, False = stop at each waypoint
         self.declare_parameter('acceptance_radius', 0.8)  # smaller = smoother transitions
         self.declare_parameter('lookahead_distance', 2.0)  # advance to next WP when this close
-        self.declare_parameter('loop_mission', False)  # Auto-loop trajectories
+        self.declare_parameter('loop_mission', False)  # Auto-loop trajectories (False = stop at last waypoint)
         
         self.continuous_mode = self.get_parameter('continuous_mode').get_parameter_value().bool_value
         self.acceptance_radius = self.get_parameter('acceptance_radius').get_parameter_value().double_value
@@ -65,12 +64,12 @@ class WaypointPublisher(Node):
         # Format: [x (North), y (East), z (Down), yaw]
         # Default waypoints (can be overridden by trajectory modes)
         self.waypoints = [
-            [0.0, 0.0, -5.0, 0.0],      # Waypoint 1: Origin, 5m altitude
-            [50.0, 0.0, -5.0, 0.0],    # Waypoint 2: 10m North, 10m altitude
-            [50.0, 50.0, -5.0, 0.0],   # Waypoint 3: 20m North, 10m East, 15m altitude
-            [0.0, 50.0, -5.0, 0.0],   # Waypoint 4: 10m North, 20m East, 10m altitude 
-            [0.0, 100.0, -5.0, 0.0],     # Waypoint 5: 10m East, 5m altitude
-            [50.0, 100.0, -5.0, 0.0],      # Waypoint 6: Back to origin
+            [0.0, 0.0, -5.0, 0.0],      # Waypoint 1: Origin, 5m altitude (ENU: Z positive = up)
+            [50.0, 0.0, -5.0, 0.0],     # Waypoint 2: 50m East, 5m altitude
+            [50.0, 50.0, -5.0, 0.0],    # Waypoint 3: 50m East, 50m North, 5m altitude
+            [0.0, 50.0, -5.0, 0.0],     # Waypoint 4: 50m North, 5m altitude 
+            [0.0, 100.0, -5.0, 0.0],    # Waypoint 5: 100m North, 5m altitude
+            [50.0, 100.0, -5.0, 0.0],   # Waypoint 6: 50m East, 100m North, 5m altitude
         ]
         
         # ===== Trajectory Mode Selection =====
@@ -82,24 +81,24 @@ class WaypointPublisher(Node):
         self.declare_parameter('circle_center_n', 0.0)
         self.declare_parameter('circle_center_e', 0.0)
         self.declare_parameter('circle_radius', 25.0)
-        self.declare_parameter('circle_altitude', -5.0)  # NED down
+        self.declare_parameter('circle_altitude', 5.0)  # ENU: Z positive = up
         self.declare_parameter('circle_points', 80)  # Increased for smooth trajectory
         
         # Square parameters
         self.declare_parameter('square_center_n', 0.0)
         self.declare_parameter('square_center_e', 0.0)
         self.declare_parameter('square_size', 40.0)
-        self.declare_parameter('square_altitude', -5.0)
+        self.declare_parameter('square_altitude', 5.0)  # ENU: Z positive = up
         self.declare_parameter('square_points_per_side', 10)  # Increased for smooth sides
         
-        # Helix parameters
+        # Helix parameters (matched to academic paper trajectory)
         self.declare_parameter('helix_center_n', 0.0)
         self.declare_parameter('helix_center_e', 0.0)
-        self.declare_parameter('helix_radius', 20.0)
-        self.declare_parameter('helix_start_altitude', -5.0)
-        self.declare_parameter('helix_end_altitude', -25.0)
-        self.declare_parameter('helix_turns', 3.0)  # number of full rotations
-        self.declare_parameter('helix_points', 120)  # Increased for smooth spiral
+        self.declare_parameter('helix_radius', 1.0)         # 1m radius for tight spiral
+        self.declare_parameter('helix_start_altitude', 10.0)   # Start at 10m height (ENU)
+        self.declare_parameter('helix_end_altitude', 30.0)     # End at 30m height (ENU)
+        self.declare_parameter('helix_turns', 3.0)          # 3 complete rotations
+        self.declare_parameter('helix_points', 120)         # 120 points for smooth tracking
         
         # Generate trajectory based on mode
         if self.waypoint_mode == 'circle':
@@ -147,7 +146,13 @@ class WaypointPublisher(Node):
         
     def position_callback(self, msg):
         """Update current drone position and manage waypoint transitions"""
-        self.current_position = np.array([msg.x, msg.y, msg.z])
+        # MAVROS local_position/pose uses ENU frame
+        # Convert ENU to NED for internal waypoint distance calculations
+        self.current_position = np.array([
+            msg.pose.position.y,   # ENU Y (North) → NED X
+            msg.pose.position.x,   # ENU X (East) → NED Y
+            -msg.pose.position.z   # ENU Z (Up) → NED Z (Down, negative)
+        ])
         
         # Skip if mission already complete and not looping
         if self.mission_complete and not self.loop_mission:
@@ -220,7 +225,7 @@ class WaypointPublisher(Node):
                         self.mission_complete = True
         
     def publish_waypoint(self):
-        """Publish current waypoint"""
+        """Publish current waypoint (convert NED waypoints to ENU for MAVROS)"""
         if self.current_waypoint_index < len(self.waypoints):
             wp = self.waypoints[self.current_waypoint_index]
             
@@ -228,10 +233,12 @@ class WaypointPublisher(Node):
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = 'map'
             
-            # Position (NED)
-            msg.pose.position.x = wp[0]
-            msg.pose.position.y = wp[1]
-            msg.pose.position.z = wp[2]
+            # Convert NED waypoint to ENU for MAVROS
+            # NED: [North, East, Down]
+            # ENU: [East, North, Up]
+            msg.pose.position.x = wp[1]   # NED East → ENU X
+            msg.pose.position.y = wp[0]   # NED North → ENU Y
+            msg.pose.position.z = -wp[2]  # NED Down → ENU Z (negative, up is positive)
             
             # Orientation (yaw only, convert to quaternion)
             yaw = wp[3]
@@ -321,65 +328,92 @@ class WaypointPublisher(Node):
         )
         return waypoints
     
-    def generate_helix_waypoints(self, center_n=0.0, center_e=0.0, radius=20.0,
-                                 start_altitude=-5.0, end_altitude=-25.0,
-                                 turns=3.0, num_points=48):
+    def generate_helix_waypoints(self, center_n=0.0, center_e=0.0, radius=1.0,
+                                 start_altitude=-10.0, end_altitude=-30.0,
+                                 turns=3.0, num_points=120, add_transition=True):
         """Generate waypoints in a helix (spiral) trajectory (NED frame).
         
+        Matches the helix shape from academic paper: descending spiral with
+        consistent radius and smooth vertical descent.
+        
         Args:
-            center_n: Center North coordinate
-            center_e: Center East coordinate
-            radius: Helix radius in meters
-            start_altitude: Starting altitude (NED down, negative = up)
-            end_altitude: Ending altitude (NED down, negative = up)
-            turns: Number of complete 360° rotations
-            num_points: Total number of waypoints
+            center_n: Center North coordinate (m)
+            center_e: Center East coordinate (m)
+            radius: Helix radius in meters (default 1.0m for tight spiral)
+            start_altitude: Starting altitude NED (negative = up, default -10m = 10m above ground)
+            end_altitude: Ending altitude NED (negative = up, default -30m = 30m above ground)
+            turns: Number of complete 360° rotations (default 3.0)
+            num_points: Total number of waypoints (default 120 for smooth tracking)
+            add_transition: Add single transition from hover to center (default True)
             
         Returns:
-            List of [n, e, d, yaw] waypoints
+            List of [n, e, d, yaw] waypoints forming descending helix
+            
+        Trajectory structure:
+            1. (Optional) Transition waypoint: hover → (center_n, center_e, start_altitude)
+            2. First helix point: (center_n + radius, center_e, start_altitude) - angle=0°
+            3. Subsequent points: smooth circular descent with consistent radius
+            
+        Note:
+            - NED frame: z-down (negative altitude = upward)
+            - Yaw faces tangent to spiral for natural orientation
+            - High point density ensures smooth MPC tracking
+            - Single transition to center, then helix naturally starts circular motion
         """
         waypoints = []
+        
+        # Add single transition waypoint for smooth entry (if enabled)
+        # Moves drone from hover position to helix center at start altitude
+        # Then first helix point naturally starts the circular motion
+        if add_transition:
+            waypoints.append([float(center_n), float(center_e), float(start_altitude), 0.0])
+        
+        # Generate main helix trajectory
         for i in range(num_points):
-            t = i / (num_points - 1)  # 0 to 1
-            angle = 2.0 * np.pi * turns * t
+            t = i / (num_points - 1)  # Normalized time 0 to 1
+            angle = 2.0 * np.pi * turns * t  # Angular position
+            
+            # Circular path in horizontal plane
             n = center_n + radius * np.cos(angle)
             e = center_e + radius * np.sin(angle)
+            
+            # Linear descent in vertical axis
             d = start_altitude + t * (end_altitude - start_altitude)
-            yaw = angle + np.pi / 2.0  # Face tangent
+            
+            # Yaw tangent to path (perpendicular to radius vector)
+            yaw = angle + np.pi / 2.0
+            
             waypoints.append([float(n), float(e), float(d), float(yaw)])
         
-        direction = "ascending" if end_altitude > start_altitude else "descending"
+        # Log trajectory parameters
+        total_height = abs(end_altitude - start_altitude)
+        direction = "descending" if end_altitude < start_altitude else "ascending"
+        transition_count = 1 if add_transition else 0
+        transition_info = f" + {transition_count} transition" if add_transition else ""
+        
         self.get_logger().info(
-            f'Helix trajectory: center=({center_n:.1f},{center_e:.1f}), '
-            f'radius={radius:.1f}m, {-start_altitude:.1f}m→{-end_altitude:.1f}m ({direction}), '
-            f'{turns:.1f} turns, {num_points} points'
+            f'📐 Helix trajectory generated:'
         )
+        self.get_logger().info(
+            f'   Center: ({center_n:.1f}, {center_e:.1f}) m'
+        )
+        self.get_logger().info(
+            f'   Radius: {radius:.1f} m'
+        )
+        self.get_logger().info(
+            f'   Altitude: {-start_altitude:.1f}m → {-end_altitude:.1f}m ({direction}, Δ={total_height:.1f}m)'
+        )
+        self.get_logger().info(
+            f'   Turns: {turns:.1f} rotations'
+        )
+        self.get_logger().info(
+            f'   Points: {num_points} helix{transition_info} = {len(waypoints)} total'
+        )
+        self.get_logger().info(
+            f'   Arc length: ~{2*np.pi*radius*turns:.1f}m horizontal + {total_height:.1f}m vertical'
+        )
+        
         return waypoints
-    
-    # def generate_helix_waypoints(self, center_n=0.0, center_e=0.0, radius=20.0,
-    #                              start_altitude=-5.0, end_altitude=-25.0,
-    #                              turns=3.0, num_points=48, loop=False):
-    #     """
-    #     NED (down positif). Jika loop=True, titik terakhir tidak sama dengan titik awal.
-    #     """
-    #     waypoints = []
-    #     t = np.linspace(0.0, 1.0, num_points, endpoint=loop)  # endpoint=False untuk loop
-    #     for ti in t:
-    #         angle = 2.0 * np.pi * turns * ti
-    #         n = center_n + radius * np.cos(angle)
-    #         e = center_e + radius * np.sin(angle)
-    #         d = start_altitude + ti * (end_altitude - start_altitude)
-    #         yaw = angle + np.pi / 2.0
-    #         waypoints.append([float(n), float(e), float(d), float(yaw)])
-
-    #     direction = "ascending" if end_altitude > start_altitude else "descending"
-    #     self.get_logger().info(
-    #         f'Helix trajectory: center=({center_n:.1f},{center_e:.1f}), '
-    #         f'radius={radius:.1f}m, {-start_altitude:.1f}m→{-end_altitude:.1f}m ({direction}), '
-    #         f'{turns:.1f} turns, {num_points} points, loop={loop}'
-    #     )
-    #     return waypoints
-
     
     def next_waypoint(self):
         """Manually move to next waypoint (for external control)"""
@@ -395,7 +429,7 @@ class WaypointPublisher(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = WaypointPublisher()
+    node = WaypointPublisherMavros()
     
     try:
         rclpy.spin(node)
